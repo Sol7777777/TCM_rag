@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 from pathlib import Path
 
-from .config import AppConfig, load_config
+from .config import AppConfig, get_env, load_config
 from .embeddings.openai_embedder import OpenAIEmbedder
 from .embeddings.sbert import SentenceTransformerEmbedder
+from .errors import DependencyNotInstalledError
 from .ingest.pdf import extract_paragraphs_from_pdf
 from .llamaindex_rag import build_index as li_build_index
 from .llamaindex_rag import download_models as li_download_models
 from .llamaindex_rag import open_query_engine as li_open_query_engine
+from .llamaindex_rag import open_retriever as li_open_retriever
 from .llamaindex_rag import query as li_query
 from .llamaindex_rag import retrieve_contexts as li_retrieve_contexts
+from .llamaindex_rag import retrieve_contexts_from_retriever as li_retrieve_contexts_from_retriever
 from .pipeline.rag import RAGPipeline
 from .rerank.cross_encoder import CrossEncoderReranker
 from .text.splitter import split_text
 from .vectorstores.chroma_store import ChromaVectorStore
+from .modelscope import snapshot_download as ms_snapshot_download
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_query = sub.add_parser("query", help="检索问答")
     p_query.add_argument("text", help="用户问题")
+    p_query.add_argument("--stdin", action="store_true", help="从 stdin 读取用户问题")
     p_query.add_argument("--top-k", type=int, default=5)
     p_query.add_argument("--print-prompt", action="store_true")
     p_query.add_argument("--json", action="store_true")
@@ -45,12 +51,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_li_query = sub.add_parser("li-query", help="用LlamaIndex检索问答")
     p_li_query.add_argument("text", help="用户问题")
+    p_li_query.add_argument("--stdin", action="store_true", help="从 stdin 读取用户问题")
     p_li_query.add_argument("--with-contexts", action="store_true", help="输出被检索的文档片段")
     p_li_query.add_argument("--debug", action="store_true", help="输出 formatted_prompt")
     p_li_query.add_argument("--json", action="store_true")
 
     p_li_retrieve = sub.add_parser("li-retrieve", help="用LlamaIndex仅检索不生成")
     p_li_retrieve.add_argument("text", help="用户问题")
+    p_li_retrieve.add_argument("--stdin", action="store_true", help="从 stdin 读取用户问题")
     p_li_retrieve.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -60,7 +68,13 @@ def main(argv: list[str] | None = None) -> int:
         _cmd_ingest(cfg, reset=bool(args.reset))
         return 0
     if args.command == "query":
-        _cmd_query(cfg, query=args.text, top_k=int(args.top_k), print_prompt=bool(args.print_prompt), as_json=bool(args.json))
+        _cmd_query(
+            cfg,
+            query=_read_query_text(args.text, use_stdin=bool(args.stdin)),
+            top_k=int(args.top_k),
+            print_prompt=bool(args.print_prompt),
+            as_json=bool(args.json),
+        )
         return 0
     if args.command == "download-models":
         _cmd_download_models(cfg)
@@ -71,18 +85,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "li-query":
         _cmd_li_query(
             cfg,
-            query=args.text,
+            query=_read_query_text(args.text, use_stdin=bool(args.stdin)),
             include_contexts=bool(args.with_contexts),
             enable_debug=bool(args.debug),
             as_json=bool(args.json),
         )
         return 0
     if args.command == "li-retrieve":
-        _cmd_li_retrieve(cfg, query=args.text, as_json=bool(args.json))
+        _cmd_li_retrieve(cfg, query=_read_query_text(args.text, use_stdin=bool(args.stdin)), as_json=bool(args.json))
         return 0
 
     parser.print_help()
     return 2
+
+
+def _read_query_text(arg_text: str, *, use_stdin: bool) -> str:
+    if not use_stdin:
+        return str(arg_text)
+    data = sys.stdin.read()
+    if not data:
+        return str(arg_text)
+    return data.strip()
 
 
 def _cmd_ingest(cfg: AppConfig, *, reset: bool) -> None:
@@ -122,8 +145,9 @@ def _cmd_query(
     embedder = _build_embedder(cfg)
     store = _build_store(cfg, reset=False)
     reranker = _build_reranker(cfg)
+    llm = _build_llm(cfg)
 
-    pipe = RAGPipeline(vector_store=store, embedder=embedder, reranker=reranker, llm=None)
+    pipe = RAGPipeline(vector_store=store, embedder=embedder, reranker=reranker, llm=llm)
     result = pipe.query(user_query=query, top_k=top_k)
 
     if as_json:
@@ -143,6 +167,11 @@ def _cmd_query(
     for i, c in enumerate(result.contexts, start=1):
         print(f"[{i}] {c}")
         print()
+
+    if result.answer is None:
+        print("（未启用LLM，未生成回答）")
+        return
+    print(result.answer)
 
 
 def _cmd_download_models(cfg: AppConfig) -> None:
@@ -192,8 +221,8 @@ def _cmd_li_query(
 
 
 def _cmd_li_retrieve(cfg: AppConfig, *, query: str, as_json: bool) -> None:
-    query_engine, _ = li_open_query_engine(cfg, enable_debug=False)
-    contexts = li_retrieve_contexts(cfg, query_engine=query_engine, user_query=query)
+    retriever = li_open_retriever(cfg)
+    contexts = li_retrieve_contexts_from_retriever(cfg, retriever=retriever, user_query=query)
     if as_json:
         print(json.dumps({"query": query, "contexts": contexts}, ensure_ascii=False, indent=2))
         return
@@ -210,7 +239,11 @@ def _build_embedder(cfg: AppConfig):
     if provider == "openai":
         return OpenAIEmbedder(model=cfg.embeddings.model, dimensions=cfg.embeddings.dimensions)
     if provider in {"sbert", "sentence_transformers"}:
-        return SentenceTransformerEmbedder(model=cfg.embeddings.model)
+        model = str(cfg.embeddings.model)
+        p = Path(model)
+        if not p.exists():
+            model = ms_snapshot_download(model_id=model, cache_dir=cfg.resolve_path(cfg.modelscope.cache_dir))
+        return SentenceTransformerEmbedder(model=model)
     raise ValueError(f"不支持的 embeddings.provider: {cfg.embeddings.provider}")
 
 
@@ -235,3 +268,43 @@ def _build_reranker(cfg: AppConfig):
     if provider in {"cross_encoder", "cross-encoder"}:
         return CrossEncoderReranker(model=cfg.rerank.model)
     raise ValueError(f"不支持的 rerank.provider: {cfg.rerank.provider}")
+
+
+def _build_llm(cfg: AppConfig):
+    if not cfg.llm.enabled:
+        return None
+    provider = cfg.llm.provider.lower().strip()
+    if provider != "openai":
+        raise ValueError(f"不支持的 llm.provider: {cfg.llm.provider}")
+
+    client = _create_openai_client()
+
+    def _call(prompt: str) -> str:
+        resp = client.chat.completions.create(
+            model=str(cfg.llm.model),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        msg = resp.choices[0].message
+        return (msg.content or "").strip()
+
+    return _call
+
+
+def _create_openai_client():
+    try:
+        openai = importlib.import_module("openai")
+    except Exception as e:
+        raise DependencyNotInstalledError("缺少可选依赖: openai，请安装 extra: openai") from e
+
+    api_key = get_env("OPENAI_API_KEY")
+    if not api_key:
+        raise DependencyNotInstalledError("缺少环境变量 OPENAI_API_KEY")
+
+    base_url = get_env("OPENAI_BASE_URL")
+    if base_url:
+        return openai.OpenAI(api_key=api_key, base_url=base_url)
+    return openai.OpenAI(api_key=api_key)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
