@@ -47,12 +47,40 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class ModelScopeConfig:
+    cache_dir: str
+
+
+@dataclass(frozen=True)
+class LlamaIndexConfig:
+    enabled: bool
+    documents_dir: str
+    required_exts: list[str]
+    persist_dir: str
+    chunk_size: int
+    similarity_top_k: int
+    embedding_model_id: str
+    llm_model_id: str
+    system_prompt: str
+    qa_prompt: str
+    refine_prompt: str
+    context_window: int
+    max_new_tokens: int
+    temperature: float
+    do_sample: bool
+    torch_dtype: str
+    device_map: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     ingest: IngestConfig
     embeddings: EmbeddingsConfig
     vector_store: VectorStoreConfig
     rerank: RerankConfig
     llm: LLMConfig
+    modelscope: ModelScopeConfig
+    llamaindex: LlamaIndexConfig
 
     @property
     def repo_root(self) -> Path:
@@ -82,6 +110,8 @@ def _parse_config(raw: dict[str, Any]) -> AppConfig:
     vector_store_raw = raw.get("vector_store") or {}
     rerank_raw = raw.get("rerank") or {}
     llm_raw = raw.get("llm") or {}
+    modelscope_raw = raw.get("modelscope") or {}
+    llamaindex_raw = raw.get("llamaindex") or {}
 
     ingest = IngestConfig(
         pdf_path=str(ingest_raw.get("pdf_path", "")),
@@ -111,8 +141,58 @@ def _parse_config(raw: dict[str, Any]) -> AppConfig:
         enabled=bool(llm_raw.get("enabled", False)),
     )
 
-    if not ingest.pdf_path:
-        raise ConfigurationError("ingest.pdf_path 不能为空")
+    modelscope = ModelScopeConfig(
+        cache_dir=str(modelscope_raw.get("cache_dir", str(Path("data") / "modelscope"))),
+    )
+    llamaindex = LlamaIndexConfig(
+        enabled=bool(llamaindex_raw.get("enabled", False)),
+        documents_dir=str(llamaindex_raw.get("documents_dir", "documents")),
+        required_exts=list(llamaindex_raw.get("required_exts", [".txt"])),
+        persist_dir=str(llamaindex_raw.get("persist_dir", "data/doc_emb")),
+        chunk_size=int(llamaindex_raw.get("chunk_size", 256)),
+        similarity_top_k=int(llamaindex_raw.get("similarity_top_k", 5)),
+        embedding_model_id=str(llamaindex_raw.get("embedding_model_id", "BAAI/bge-base-zh-v1.5")),
+        llm_model_id=str(llamaindex_raw.get("llm_model_id", "Qwen/Qwen2.5-7B-Instruct")),
+        system_prompt=str(llamaindex_raw.get("system_prompt", "你是一个医疗人工智能助手。")),
+        qa_prompt=str(
+            llamaindex_raw.get(
+                "qa_prompt",
+                (
+                    "上下文信息如下。\n"
+                    "---------------------\n"
+                    "{context_str}\n"
+                    "---------------------\n"
+                    "请根据上下文信息而不是先验知识来回答以下的查询。作为一个医疗人工智能助手，你的回答要尽可能严谨。\n"
+                    "Query: {query_str}\n"
+                    "Answer: "
+                ),
+            )
+        ),
+        refine_prompt=str(
+            llamaindex_raw.get(
+                "refine_prompt",
+                (
+                    "原始查询如下：{query_str}"
+                    "我们提供了现有答案：{existing_answer}"
+                    "我们有机会通过下面的更多上下文来完善现有答案（仅在需要时）。"
+                    "------------"
+                    "{context_msg}"
+                    "------------"
+                    "考虑到新的上下文，优化原始答案以更好地回答查询。 如果上下文没有用，请返回原始答案。"
+                    "Refined Answer:"
+                ),
+            )
+        ),
+        context_window=int(llamaindex_raw.get("context_window", 4096)),
+        max_new_tokens=int(llamaindex_raw.get("max_new_tokens", 2048)),
+        temperature=float(llamaindex_raw.get("temperature", 0.0)),
+        do_sample=bool(llamaindex_raw.get("do_sample", False)),
+        torch_dtype=str(llamaindex_raw.get("torch_dtype", "float16")),
+        device_map=str(llamaindex_raw.get("device_map", "auto")),
+    )
+
+    if not ingest.pdf_path and not llamaindex.enabled:
+        raise ConfigurationError("ingest.pdf_path 不能为空（除非 llamaindex.enabled=true）")
     if ingest.min_line_length < 0 or ingest.chunk_size <= 0 or ingest.overlap_size < 0:
         raise ConfigurationError("ingest 参数不合法")
 
@@ -122,6 +202,8 @@ def _parse_config(raw: dict[str, Any]) -> AppConfig:
         vector_store=vector_store,
         rerank=rerank,
         llm=llm,
+        modelscope=modelscope,
+        llamaindex=llamaindex,
     )
 
 
@@ -130,4 +212,3 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     if v is None or v == "":
         return default
     return v
-
